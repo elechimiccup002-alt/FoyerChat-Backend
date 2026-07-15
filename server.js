@@ -210,15 +210,29 @@ app.post("/api/auth/register", async (req, res) => {
   const cleanHandle = handle.trim().toLowerCase().replace(/\s+/g, ".");
   const emailLc = email.trim().toLowerCase();
 
-  if (db.prepare("SELECT 1 FROM users WHERE email = ?").get(emailLc))
-    return res.status(409).json({ error: "Email già registrata" });
-  if (db.prepare("SELECT 1 FROM users WHERE handle = ?").get(cleanHandle))
+  const existing = db.prepare("SELECT * FROM users WHERE email = ?").get(emailLc);
+  /* email già verificata da un account attivo → è un conflitto vero */
+  if (existing && existing.verified)
+    return res.status(409).json({ error: "Email già registrata. Prova ad accedere." });
+
+  /* handle in uso da un ALTRO utente (verificato o meno) → conflitto */
+  const handleOwner = db.prepare("SELECT id FROM users WHERE handle = ?").get(cleanHandle);
+  if (handleOwner && (!existing || handleOwner.id !== existing.id))
     return res.status(409).json({ error: "Handle già in uso" });
 
-  const id = uid();
-  db.prepare(`INSERT INTO users (id, email, password_hash, name, age, handle, city, created_at)
-              VALUES (?,?,?,?,?,?,?,?)`)
-    .run(id, emailLc, bcrypt.hashSync(password, 10), name.trim(), a, cleanHandle, (city || "").trim(), nowMs());
+  let id;
+  if (existing) {
+    /* registrazione lasciata a metà: riusa l'account non verificato invece
+       di bloccare l'utente con "email già registrata" */
+    id = existing.id;
+    db.prepare(`UPDATE users SET password_hash=?, name=?, age=?, handle=?, city=? WHERE id=?`)
+      .run(bcrypt.hashSync(password, 10), name.trim(), a, cleanHandle, (city || "").trim(), id);
+  } else {
+    id = uid();
+    db.prepare(`INSERT INTO users (id, email, password_hash, name, age, handle, city, created_at)
+                VALUES (?,?,?,?,?,?,?,?)`)
+      .run(id, emailLc, bcrypt.hashSync(password, 10), name.trim(), a, cleanHandle, (city || "").trim(), nowMs());
+  }
 
   const code = String(Math.floor(100000 + Math.random() * 900000));
   db.prepare("INSERT OR REPLACE INTO verification_codes (email, code, expires_at) VALUES (?,?,?)")
@@ -230,7 +244,27 @@ app.post("/api/auth/register", async (req, res) => {
     console.error("Errore invio email:", e.message);
     return res.status(500).json({ error: "Invio email fallito, riprova" });
   }
-  res.json({ ok: true, message: "Codice inviato via email" });
+  res.json({ ok: true, message: "Codice inviato via email", pending: true });
+});
+
+/* reinvia un nuovo codice per un account già creato ma non ancora verificato
+   (usato quando l'utente torna sul sito con una verifica lasciata a metà) */
+app.post("/api/auth/resend-code", async (req, res) => {
+  const emailLc = (req.body?.email || "").trim().toLowerCase();
+  const user = db.prepare("SELECT * FROM users WHERE email = ?").get(emailLc);
+  if (!user) return res.status(404).json({ error: "Nessuna registrazione trovata per questa email" });
+  if (user.verified) return res.status(409).json({ error: "Email già verificata, effettua il login" });
+
+  const code = String(Math.floor(100000 + Math.random() * 900000));
+  db.prepare("INSERT OR REPLACE INTO verification_codes (email, code, expires_at) VALUES (?,?,?)")
+    .run(emailLc, code, nowMs() + 15 * 60 * 1000);
+  try {
+    await sendVerificationEmail(emailLc, code);
+  } catch (e) {
+    console.error("Errore invio email:", e.message);
+    return res.status(500).json({ error: "Invio email fallito, riprova" });
+  }
+  res.json({ ok: true });
 });
 
 /* step 2: verifica codice → account attivo + token */
@@ -441,26 +475,45 @@ io.on("connection", (socket) => {
   });
 
   socket.on("message", ({ roomId, text, image, sensitive }) => {
-    if (socket.data.guest) return socket.emit("errorMsg", "Registrati per scrivere");
     const isDm = roomId.startsWith("dm-");
+
     if (isDm) {
+      /* le DM richiedono sempre un utente registrato e partecipante */
+      if (socket.data.guest) return socket.emit("errorMsg", "Registrati per scrivere");
       const dm = db.prepare("SELECT * FROM dms WHERE id = ?").get(roomId);
       if (!dm || (dm.user_a !== socket.data.user.id && dm.user_b !== socket.data.user.id))
         return socket.emit("errorMsg", "DM non trovata");
     } else {
       const room = db.prepare("SELECT * FROM rooms WHERE id = ?").get(roomId);
       if (!room) return;
+      /* i guest possono scrivere SOLO nelle stanze ad accesso "open" */
+      if (socket.data.guest && room.access !== "open")
+        return socket.emit("errorMsg", "Registrati per scrivere in questa stanza");
     }
-    const userId = socket.data.user.id;
-    const u = db.prepare("SELECT name, handle, avatar FROM users WHERE id = ?").get(userId);
+
+    /* utente: registrato normale, oppure guest anonimo con id generato per il socket */
+    let userId, u;
+    if (socket.data.guest) {
+      if (!socket.data.guestId) socket.data.guestId = `guest-${socket.id}`;
+      userId = socket.data.guestId;
+      u = { name: "Guest", handle: "guest", avatar: "" };
+    } else {
+      userId = socket.data.user.id;
+      u = db.prepare("SELECT name, handle, avatar FROM users WHERE id = ?").get(userId);
+    }
+
     const msg = {
       id: uid(), room_id: roomId, user_id: userId,
       text: String(text || "").slice(0, 2000),
       image: image || null, sensitive: sensitive ? 1 : 0,
       created_at: nowMs(),
     };
-    db.prepare("INSERT INTO messages (id, room_id, user_id, text, image, sensitive, created_at) VALUES (?,?,?,?,?,?,?)")
-      .run(msg.id, msg.room_id, msg.user_id, msg.text, msg.image, msg.sensitive, msg.created_at);
+    /* i messaggi dei guest anonimi non vengono salvati in cronologia
+       (non hanno un utente reale in tabella users da referenziare) */
+    if (!socket.data.guest) {
+      db.prepare("INSERT INTO messages (id, room_id, user_id, text, image, sensitive, created_at) VALUES (?,?,?,?,?,?,?)")
+        .run(msg.id, msg.room_id, msg.user_id, msg.text, msg.image, msg.sensitive, msg.created_at);
+    }
     io.to(roomId).emit("message", { ...msg, ...u });
   });
 
