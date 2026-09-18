@@ -27,8 +27,25 @@ import { fileURLToPath } from "url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET || "cambiami-in-produzione";
-const FRONTEND_URL = process.env.FRONTEND_URL || "*";
 const RESEND_API_KEY = process.env.RESEND_API_KEY || null;
+
+/* FRONTEND_URL può contenere PIÙ indirizzi separati da virgola
+   (es. il sito su Netlify E quello su Cloudflare insieme).
+   Ogni indirizzo viene ripulito da spazi e dallo slash finale,
+   che altrimenti fa fallire il confronto con l'origine del browser. */
+const FRONTEND_URLS = (process.env.FRONTEND_URL || "*")
+  .split(",")
+  .map((u) => u.trim().replace(/\/+$/, ""))
+  .filter(Boolean);
+
+function corsOriginCheck(origin, callback) {
+  /* richieste senza origin (es. curl, health check) sempre permesse;
+     "*" nella lista permette qualunque origine (utile in fase di test) */
+  if (!origin || FRONTEND_URLS.includes("*") || FRONTEND_URLS.includes(origin)) {
+    return callback(null, true);
+  }
+  callback(new Error("Origine non autorizzata (CORS): " + origin));
+}
 
 /* ———— email (Resend) ———— */
 let resend = null;
@@ -137,9 +154,9 @@ if (seedRooms.n === 0) {
 /* ———— app ———— */
 const app = express();
 const httpServer = createServer(app);
-const io = new Server(httpServer, { cors: { origin: FRONTEND_URL } });
+const io = new Server(httpServer, { cors: { origin: corsOriginCheck } });
 
-app.use(cors({ origin: FRONTEND_URL }));
+app.use(cors({ origin: corsOriginCheck }));
 app.use(express.json({ limit: "1mb" }));
 
 /* upload foto su disco */
