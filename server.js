@@ -1,3 +1,4 @@
+
 /* ————————————————————————————————————————————————————————————
    FOYER BACKEND — server.js
    Stack: Express + Socket.io + SQLite (better-sqlite3) + JWT
@@ -60,7 +61,7 @@ async function sendVerificationEmail(to, code) {
     return;
   }
   await resend.emails.send({
-    from: "Foyer <onboarding@resend.dev>", // sostituisci col tuo dominio verificato
+    from: "Foyer <noreply@foyerchat.com>",
     to,
     subject: `${code} è il tuo codice Foyer`,
     html: `<div style="font-family:sans-serif;max-width:420px;margin:0 auto">
