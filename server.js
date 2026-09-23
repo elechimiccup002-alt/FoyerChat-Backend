@@ -57,10 +57,10 @@ if (RESEND_API_KEY) {
 
 async function sendVerificationEmail(to, code) {
   if (!resend) {
-    console.log(`[DEV] Codice di verifica per ${to}: ${code}`);
+    console.log(`[DEV] RESEND_API_KEY non impostata — codice di verifica per ${to}: ${code}`);
     return;
   }
-  await resend.emails.send({
+  const { data, error } = await resend.emails.send({
     from: "Foyer <noreply@foyerchat.com>",
     to,
     subject: `${code} è il tuo codice Foyer`,
@@ -71,6 +71,14 @@ async function sendVerificationEmail(to, code) {
       <p style="color:#888">Scade tra 15 minuti. Se non hai richiesto tu questo codice, ignora questa mail.</p>
     </div>`,
   });
+  /* il SDK di Resend NON lancia un'eccezione sugli errori dell'API:
+     restituisce { data, error } anche quando l'invio fallisce.
+     Senza questo controllo l'errore passava inosservato e il codice
+     finiva comunque nel database senza che l'email partisse mai. */
+  if (error) {
+    throw new Error(`Resend ha rifiutato l'invio: ${error.message || JSON.stringify(error)}`);
+  }
+  console.log(`Email di verifica inviata a ${to}, id Resend: ${data?.id}`);
 }
 
 /* ———— database ———— */
