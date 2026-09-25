@@ -1,4 +1,3 @@
-
 /* ————————————————————————————————————————————————————————————
    FOYER BACKEND — server.js
    Stack: Express + Socket.io + SQLite (better-sqlite3) + JWT
@@ -99,6 +98,7 @@ CREATE TABLE IF NOT EXISTS users (
   avatar TEXT DEFAULT '',
   verified INTEGER DEFAULT 0,
   streak INTEGER DEFAULT 1,
+  private INTEGER DEFAULT 0,
   created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS verification_codes (
@@ -111,6 +111,7 @@ CREATE TABLE IF NOT EXISTS photos (
   user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   filename TEXT NOT NULL,
   position INTEGER DEFAULT 0,
+  deck INTEGER DEFAULT 1,
   created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS rooms (
@@ -209,12 +210,14 @@ function auth(req, res, next) {
 }
 
 function publicUser(u) {
-  const photos = db.prepare("SELECT id, filename, position FROM photos WHERE user_id = ? ORDER BY position").all(u.id);
+  const photos = db.prepare("SELECT id, filename, position, deck FROM photos WHERE user_id = ? ORDER BY position").all(u.id);
   const prompts = db.prepare("SELECT question, answer FROM prompts WHERE user_id = ? ORDER BY position").all(u.id);
   return {
-    id: u.id, name: u.name, age: u.age, handle: u.handle, city: u.city,
-    bio: u.bio, vibe: u.vibe, avatar: u.avatar, streak: u.streak,
-    photos: photos.map((p) => ({ id: p.id, url: `/uploads/${p.filename}` })),
+    /* "name" coincide sempre col nickname: in registrazione non si chiede
+       più un nome separato, solo il nickname (handle) */
+    id: u.id, name: u.handle, age: u.age, handle: u.handle, city: u.city,
+    bio: u.bio, vibe: u.vibe, avatar: u.avatar, streak: u.streak, private: !!u.private,
+    photos: photos.map((p) => ({ id: p.id, url: `/uploads/${p.filename}`, deck: !!p.deck })),
     prompts: prompts.map((p) => [p.question, p.answer]),
   };
 }
@@ -223,15 +226,14 @@ function publicUser(u) {
 
 /* step 1: registrazione → invia codice email */
 app.post("/api/auth/register", async (req, res) => {
-  const { email, password, name, age, handle, city } = req.body || {};
+  const { email, password, age, handle, city } = req.body || {};
   if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email))
     return res.status(400).json({ error: "Email non valida" });
   if (!password || password.length < 8)
     return res.status(400).json({ error: "Password: minimo 8 caratteri" });
-  if (!name?.trim()) return res.status(400).json({ error: "Nome obbligatorio" });
   const a = parseInt(age, 10);
   if (!a || a < 18) return res.status(400).json({ error: "Riservato ai maggiorenni (18+)" });
-  if (!handle?.trim()) return res.status(400).json({ error: "Handle obbligatorio" });
+  if (!handle?.trim()) return res.status(400).json({ error: "Nickname obbligatorio" });
 
   const cleanHandle = handle.trim().toLowerCase().replace(/\s+/g, ".");
   const emailLc = email.trim().toLowerCase();
@@ -244,20 +246,22 @@ app.post("/api/auth/register", async (req, res) => {
   /* handle in uso da un ALTRO utente (verificato o meno) → conflitto */
   const handleOwner = db.prepare("SELECT id FROM users WHERE handle = ?").get(cleanHandle);
   if (handleOwner && (!existing || handleOwner.id !== existing.id))
-    return res.status(409).json({ error: "Handle già in uso" });
+    return res.status(409).json({ error: "Nickname già in uso" });
 
+  /* non si chiede più un "nome" separato: il campo esiste ancora nello
+     schema per compatibilità, ma coincide sempre col nickname */
   let id;
   if (existing) {
     /* registrazione lasciata a metà: riusa l'account non verificato invece
        di bloccare l'utente con "email già registrata" */
     id = existing.id;
     db.prepare(`UPDATE users SET password_hash=?, name=?, age=?, handle=?, city=? WHERE id=?`)
-      .run(bcrypt.hashSync(password, 10), name.trim(), a, cleanHandle, (city || "").trim(), id);
+      .run(bcrypt.hashSync(password, 10), cleanHandle, a, cleanHandle, (city || "").trim(), id);
   } else {
     id = uid();
     db.prepare(`INSERT INTO users (id, email, password_hash, name, age, handle, city, created_at)
                 VALUES (?,?,?,?,?,?,?,?)`)
-      .run(id, emailLc, bcrypt.hashSync(password, 10), name.trim(), a, cleanHandle, (city || "").trim(), nowMs());
+      .run(id, emailLc, bcrypt.hashSync(password, 10), cleanHandle, a, cleanHandle, (city || "").trim(), nowMs());
   }
 
   const code = String(Math.floor(100000 + Math.random() * 900000));
@@ -326,11 +330,21 @@ app.get("/api/me", auth, (req, res) => {
 });
 
 app.patch("/api/me", auth, (req, res) => {
-  const { bio, vibe, city, avatar } = req.body || {};
-  db.prepare("UPDATE users SET bio = COALESCE(?, bio), vibe = COALESCE(?, vibe), city = COALESCE(?, city), avatar = COALESCE(?, avatar) WHERE id = ?")
-    .run(bio ?? null, vibe ?? null, city ?? null, avatar ?? null, req.user.id);
+  const { bio, vibe, city, avatar, private: priv } = req.body || {};
+  const privValue = priv === undefined ? null : (priv ? 1 : 0);
+  db.prepare("UPDATE users SET bio = COALESCE(?, bio), vibe = COALESCE(?, vibe), city = COALESCE(?, city), avatar = COALESCE(?, avatar), private = COALESCE(?, private) WHERE id = ?")
+    .run(bio ?? null, vibe ?? null, city ?? null, avatar ?? null, privValue, req.user.id);
   const u = db.prepare("SELECT * FROM users WHERE id = ?").get(req.user.id);
   res.json(publicUser(u));
+});
+
+/* carica una foto profilo vera (drag&drop o file picker), al posto degli
+   avatar preimpostati scelti in fase di registrazione */
+app.post("/api/me/avatar", auth, upload.single("avatar"), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: "Nessun file" });
+  const url = `/uploads/${req.file.filename}`;
+  db.prepare("UPDATE users SET avatar = ? WHERE id = ?").run(url, req.user.id);
+  res.json({ avatar: url });
 });
 
 /* prompt del profilo (max 3) */
@@ -357,6 +371,11 @@ app.get("/api/people", auth, (req, res) => {
 app.get("/api/people/:id", auth, (req, res) => {
   const u = db.prepare("SELECT * FROM users WHERE id = ? AND verified = 1").get(req.params.id);
   if (!u) return res.status(404).json({ error: "Profilo non trovato" });
+  /* profilo privato: chiunque non sia il titolare vede solo nickname/età,
+     niente foto, bio o prompt */
+  if (u.private && u.id !== req.user.id) {
+    return res.json({ id: u.id, name: u.handle, handle: u.handle, age: u.age, private: true });
+  }
   res.json(publicUser(u));
 });
 
@@ -382,6 +401,18 @@ app.delete("/api/me/photos/:photoId", auth, (req, res) => {
   const filePath = path.join(uploadDir, photo.filename);
   if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
   res.json({ ok: true });
+});
+
+/* accende/spegne la visibilità di una foto nello swipe deck (Persone);
+   la foto resta comunque visibile a chi apre il profilo completo */
+app.patch("/api/me/photos/:photoId", auth, (req, res) => {
+  const photo = db.prepare("SELECT * FROM photos WHERE id = ? AND user_id = ?").get(req.params.photoId, req.user.id);
+  if (!photo) return res.status(404).json({ error: "Foto non trovata" });
+  const { deck } = req.body || {};
+  if (deck !== undefined) {
+    db.prepare("UPDATE photos SET deck = ? WHERE id = ?").run(deck ? 1 : 0, photo.id);
+  }
+  res.json({ ok: true, deck: !!deck });
 });
 
 /* ————————————————— LIKE AI PROMPT ————————————————— */
