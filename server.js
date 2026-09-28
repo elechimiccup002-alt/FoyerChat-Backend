@@ -99,6 +99,7 @@ CREATE TABLE IF NOT EXISTS users (
   verified INTEGER DEFAULT 0,
   streak INTEGER DEFAULT 1,
   private INTEGER DEFAULT 0,
+  gender TEXT NOT NULL DEFAULT 'M',
   created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS verification_codes (
@@ -111,7 +112,7 @@ CREATE TABLE IF NOT EXISTS photos (
   user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   filename TEXT NOT NULL,
   position INTEGER DEFAULT 0,
-  deck INTEGER DEFAULT 1,
+  friends_only INTEGER DEFAULT 0,
   created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS rooms (
@@ -134,6 +135,7 @@ CREATE TABLE IF NOT EXISTS dms (
   id TEXT PRIMARY KEY,
   user_a TEXT NOT NULL,
   user_b TEXT NOT NULL,
+  creator_id TEXT DEFAULT '',
   created_at INTEGER NOT NULL,
   UNIQUE(user_a, user_b)
 );
@@ -150,7 +152,38 @@ CREATE TABLE IF NOT EXISTS prompts (
   answer TEXT NOT NULL,
   PRIMARY KEY (user_id, position)
 );
+CREATE TABLE IF NOT EXISTS friendships (
+  user_a TEXT NOT NULL,          -- sempre l'id "minore" (ordine alfabetico)
+  user_b TEXT NOT NULL,
+  requester_id TEXT NOT NULL,    -- chi ha mandato la richiesta
+  status TEXT NOT NULL DEFAULT 'pending', -- pending | accepted
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (user_a, user_b)
+);
+CREATE TABLE IF NOT EXISTS blocks (
+  blocker_id TEXT NOT NULL,
+  blocked_id TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (blocker_id, blocked_id)
+);
+CREATE TABLE IF NOT EXISTS mutes (
+  user_id TEXT NOT NULL,
+  muted_id TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (user_id, muted_id)
+);
 `);
+
+/* se il database esiste già (es. disco persistente), CREATE TABLE IF NOT EXISTS
+   non aggiunge le colonne nuove: le aggiungiamo qui senza perdere i dati */
+function ensureColumn(table, column, ddl) {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
+  if (!cols.includes(column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`);
+}
+ensureColumn("users", "private", "INTEGER DEFAULT 0");
+ensureColumn("users", "gender", "TEXT NOT NULL DEFAULT 'M'");
+ensureColumn("photos", "friends_only", "INTEGER DEFAULT 0");
+ensureColumn("dms", "creator_id", "TEXT DEFAULT ''");
 
 /* stanze di default */
 const seedRooms = db.prepare("SELECT COUNT(*) AS n FROM rooms").get();
@@ -209,24 +242,69 @@ function auth(req, res, next) {
   }
 }
 
-function publicUser(u) {
-  const photos = db.prepare("SELECT id, filename, position, deck FROM photos WHERE user_id = ? ORDER BY position").all(u.id);
+/* ————————————————— AMICIZIE / BLOCCHI (helper) ————————————————— */
+
+function pairIds(x, y) { return x < y ? [x, y] : [y, x]; }
+
+function getFriendship(x, y) {
+  const [a, b] = pairIds(x, y);
+  return db.prepare("SELECT * FROM friendships WHERE user_a = ? AND user_b = ?").get(a, b);
+}
+function areFriends(x, y) {
+  const f = getFriendship(x, y);
+  return !!f && f.status === "accepted";
+}
+function friendCount(userId) {
+  return db.prepare("SELECT COUNT(*) AS n FROM friendships WHERE status = 'accepted' AND (user_a = ? OR user_b = ?)")
+    .get(userId, userId).n;
+}
+function isBlockedEither(x, y) {
+  return !!db.prepare("SELECT 1 FROM blocks WHERE (blocker_id = ? AND blocked_id = ?) OR (blocker_id = ? AND blocked_id = ?)")
+    .get(x, y, y, x);
+}
+function userSummary(id) {
+  const u = db.prepare("SELECT id, handle, age, gender, avatar FROM users WHERE id = ?").get(id);
+  return u ? { id: u.id, name: u.handle, handle: u.handle, age: u.age, gender: u.gender, avatar: u.avatar } : null;
+}
+function notifyUser(userId, event) { io.to(`user:${userId}`).emit(event); }
+
+/* Profilo "completo" così come lo vede chi lo guarda (viewerId).
+   - il titolare vede tutto, comprese le foto "solo amici"
+   - gli amici accettati vedono tutto
+   - tutti gli altri NON ricevono proprio le foto "solo amici" (filtrate qui,
+     lato server, quindi non compaiono né nel profilo né nello swipe) */
+function publicUser(u, viewerId = u.id) {
+  const seesAll = viewerId === u.id || areFriends(u.id, viewerId);
+  let photos = db.prepare("SELECT id, filename, position, friends_only FROM photos WHERE user_id = ? ORDER BY position").all(u.id);
+  if (!seesAll) photos = photos.filter((p) => !p.friends_only);
   const prompts = db.prepare("SELECT question, answer FROM prompts WHERE user_id = ? ORDER BY position").all(u.id);
   return {
     /* "name" coincide sempre col nickname: in registrazione non si chiede
        più un nome separato, solo il nickname (handle) */
-    id: u.id, name: u.handle, age: u.age, handle: u.handle, city: u.city,
+    id: u.id, name: u.handle, age: u.age, handle: u.handle, city: u.city, gender: u.gender,
     bio: u.bio, vibe: u.vibe, avatar: u.avatar, streak: u.streak, private: !!u.private,
-    photos: photos.map((p) => ({ id: p.id, url: `/uploads/${p.filename}`, deck: !!p.deck })),
+    friend_count: friendCount(u.id),
+    photos: photos.map((p) => ({ id: p.id, url: `/uploads/${p.filename}`, friends_only: !!p.friends_only })),
     prompts: prompts.map((p) => [p.question, p.answer]),
   };
+}
+
+/* Come publicUser, ma rispetta il profilo privato: chi non è il titolare né
+   un suo amico vede solo nickname, età e genere (niente foto, bio, prompt) */
+function profileFor(u, viewerId) {
+  if (u.private && u.id !== viewerId && !areFriends(u.id, viewerId)) {
+    /* "restricted" = questa è una vista limitata (il client mostra il lucchetto);
+       "private" è invece l'impostazione del profilo, presente anche nella vista completa */
+    return { id: u.id, name: u.handle, handle: u.handle, age: u.age, gender: u.gender, private: true, restricted: true };
+  }
+  return publicUser(u, viewerId);
 }
 
 /* ————————————————— AUTH ————————————————— */
 
 /* step 1: registrazione → invia codice email */
 app.post("/api/auth/register", async (req, res) => {
-  const { email, password, age, handle, city } = req.body || {};
+  const { email, password, age, handle, city, gender } = req.body || {};
   if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email))
     return res.status(400).json({ error: "Email non valida" });
   if (!password || password.length < 8)
@@ -234,6 +312,9 @@ app.post("/api/auth/register", async (req, res) => {
   const a = parseInt(age, 10);
   if (!a || a < 18) return res.status(400).json({ error: "Riservato ai maggiorenni (18+)" });
   if (!handle?.trim()) return res.status(400).json({ error: "Nickname obbligatorio" });
+  const genderClean = String(gender || "").trim().toUpperCase();
+  if (genderClean !== "F" && genderClean !== "M")
+    return res.status(400).json({ error: "Seleziona F o M" });
 
   const cleanHandle = handle.trim().toLowerCase().replace(/\s+/g, ".");
   const emailLc = email.trim().toLowerCase();
@@ -255,13 +336,13 @@ app.post("/api/auth/register", async (req, res) => {
     /* registrazione lasciata a metà: riusa l'account non verificato invece
        di bloccare l'utente con "email già registrata" */
     id = existing.id;
-    db.prepare(`UPDATE users SET password_hash=?, name=?, age=?, handle=?, city=? WHERE id=?`)
-      .run(bcrypt.hashSync(password, 10), cleanHandle, a, cleanHandle, (city || "").trim(), id);
+    db.prepare(`UPDATE users SET password_hash=?, name=?, age=?, handle=?, city=?, gender=? WHERE id=?`)
+      .run(bcrypt.hashSync(password, 10), cleanHandle, a, cleanHandle, (city || "").trim(), genderClean, id);
   } else {
     id = uid();
-    db.prepare(`INSERT INTO users (id, email, password_hash, name, age, handle, city, created_at)
-                VALUES (?,?,?,?,?,?,?,?)`)
-      .run(id, emailLc, bcrypt.hashSync(password, 10), cleanHandle, a, cleanHandle, (city || "").trim(), nowMs());
+    db.prepare(`INSERT INTO users (id, email, password_hash, name, age, handle, city, gender, created_at)
+                VALUES (?,?,?,?,?,?,?,?,?)`)
+      .run(id, emailLc, bcrypt.hashSync(password, 10), cleanHandle, a, cleanHandle, (city || "").trim(), genderClean, nowMs());
   }
 
   const code = String(Math.floor(100000 + Math.random() * 900000));
@@ -335,6 +416,7 @@ app.patch("/api/me", auth, (req, res) => {
   db.prepare("UPDATE users SET bio = COALESCE(?, bio), vibe = COALESCE(?, vibe), city = COALESCE(?, city), avatar = COALESCE(?, avatar), private = COALESCE(?, private) WHERE id = ?")
     .run(bio ?? null, vibe ?? null, city ?? null, avatar ?? null, privValue, req.user.id);
   const u = db.prepare("SELECT * FROM users WHERE id = ?").get(req.user.id);
+  io.emit("people-changed"); // chi ha aperto "Persone" ricarica subito il feed
   res.json(publicUser(u));
 });
 
@@ -344,6 +426,7 @@ app.post("/api/me/avatar", auth, upload.single("avatar"), (req, res) => {
   if (!req.file) return res.status(400).json({ error: "Nessun file" });
   const url = `/uploads/${req.file.filename}`;
   db.prepare("UPDATE users SET avatar = ? WHERE id = ?").run(url, req.user.id);
+  io.emit("people-changed");
   res.json({ avatar: url });
 });
 
@@ -359,24 +442,23 @@ app.put("/api/me/prompts", auth, (req, res) => {
     prompts.forEach(([q, a], i) => ins.run(req.user.id, i, String(q).slice(0, 120), String(a).slice(0, 300)));
   });
   tx();
+  io.emit("people-changed");
   res.json({ ok: true });
 });
 
 /* elenco persone (feed) */
 app.get("/api/people", auth, (req, res) => {
-  const users = db.prepare("SELECT * FROM users WHERE verified = 1 AND id != ? ORDER BY created_at DESC LIMIT 50").all(req.user.id);
-  res.json(users.map(publicUser));
+  const me = req.user.id;
+  const users = db.prepare("SELECT * FROM users WHERE verified = 1 AND id != ? ORDER BY created_at DESC LIMIT 50").all(me);
+  /* chi ha bloccato me (o è stato bloccato da me) non compare; per ognuno
+     si applicano privacy e foto "solo amici" lato server */
+  res.json(users.filter((u) => !isBlockedEither(me, u.id)).map((u) => profileFor(u, me)));
 });
 
 app.get("/api/people/:id", auth, (req, res) => {
   const u = db.prepare("SELECT * FROM users WHERE id = ? AND verified = 1").get(req.params.id);
-  if (!u) return res.status(404).json({ error: "Profilo non trovato" });
-  /* profilo privato: chiunque non sia il titolare vede solo nickname/età,
-     niente foto, bio o prompt */
-  if (u.private && u.id !== req.user.id) {
-    return res.json({ id: u.id, name: u.handle, handle: u.handle, age: u.age, private: true });
-  }
-  res.json(publicUser(u));
+  if (!u || isBlockedEither(req.user.id, u.id)) return res.status(404).json({ error: "Profilo non disponibile" });
+  res.json(profileFor(u, req.user.id));
 });
 
 /* ————————————————— FOTO ————————————————— */
@@ -391,7 +473,8 @@ app.post("/api/me/photos", auth, upload.single("photo"), (req, res) => {
   const id = uid();
   db.prepare("INSERT INTO photos (id, user_id, filename, position, created_at) VALUES (?,?,?,?,?)")
     .run(id, req.user.id, req.file.filename, count, nowMs());
-  res.json({ id, url: `/uploads/${req.file.filename}` });
+  io.emit("people-changed");
+  res.json({ id, url: `/uploads/${req.file.filename}`, friends_only: false });
 });
 
 app.delete("/api/me/photos/:photoId", auth, (req, res) => {
@@ -400,19 +483,21 @@ app.delete("/api/me/photos/:photoId", auth, (req, res) => {
   db.prepare("DELETE FROM photos WHERE id = ?").run(photo.id);
   const filePath = path.join(uploadDir, photo.filename);
   if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+  io.emit("people-changed");
   res.json({ ok: true });
 });
 
-/* accende/spegne la visibilità di una foto nello swipe deck (Persone);
-   la foto resta comunque visibile a chi apre il profilo completo */
+/* "solo amici": se attivo, la foto la vedono solo il titolare e i suoi amici
+   accettati (né nel profilo, né nello swipe di Persone) */
 app.patch("/api/me/photos/:photoId", auth, (req, res) => {
   const photo = db.prepare("SELECT * FROM photos WHERE id = ? AND user_id = ?").get(req.params.photoId, req.user.id);
   if (!photo) return res.status(404).json({ error: "Foto non trovata" });
-  const { deck } = req.body || {};
-  if (deck !== undefined) {
-    db.prepare("UPDATE photos SET deck = ? WHERE id = ?").run(deck ? 1 : 0, photo.id);
+  const { friends_only } = req.body || {};
+  if (friends_only !== undefined) {
+    db.prepare("UPDATE photos SET friends_only = ? WHERE id = ?").run(friends_only ? 1 : 0, photo.id);
+    io.emit("people-changed");
   }
-  res.json({ ok: true, deck: !!deck });
+  res.json({ ok: true, friends_only: !!friends_only });
 });
 
 /* ————————————————— LIKE AI PROMPT ————————————————— */
@@ -459,29 +544,142 @@ app.get("/api/rooms/:roomId/messages", (req, res) => {
   res.json(msgs);
 });
 
+/* ————————————————— AMICI / BLOCCHI / SILENZIATI ————————————————— */
+
+/* tutto ciò che riguarda me: amici, richieste ricevute/inviate, bloccati, silenziati */
+app.get("/api/relations", auth, (req, res) => {
+  const me = req.user.id;
+  const rows = db.prepare("SELECT * FROM friendships WHERE user_a = ? OR user_b = ?").all(me, me);
+  const friends = [], incoming = [], outgoing = [];
+  for (const r of rows) {
+    const other = userSummary(r.user_a === me ? r.user_b : r.user_a);
+    if (!other) continue;
+    if (r.status === "accepted") friends.push(other);
+    else if (r.requester_id === me) outgoing.push(other);
+    else incoming.push(other);
+  }
+  const blocked = db.prepare("SELECT blocked_id AS id FROM blocks WHERE blocker_id = ?").all(me)
+    .map((r) => userSummary(r.id)).filter(Boolean);
+  const muted = db.prepare("SELECT muted_id AS id FROM mutes WHERE user_id = ?").all(me)
+    .map((r) => userSummary(r.id)).filter(Boolean);
+  res.json({ friends, incoming, outgoing, blocked, muted });
+});
+
+/* controlli comuni: l'altro utente esiste e non sono io */
+function relationTarget(req, res) {
+  const other = req.params.userId;
+  if (other === req.user.id) { res.status(400).json({ error: "Azione non valida su te stesso" }); return null; }
+  const target = db.prepare("SELECT id FROM users WHERE id = ? AND verified = 1").get(other);
+  if (!target) { res.status(404).json({ error: "Utente non trovato" }); return null; }
+  return other;
+}
+/* avvisa i due utenti coinvolti: ricaricano relazioni e feed in tempo reale */
+function relationsChanged(a, b) {
+  for (const id of [a, b]) { notifyUser(id, "relations-changed"); notifyUser(id, "people-changed"); }
+}
+
+/* richiesta di amicizia (se l'altro me l'aveva già mandata, diventiamo amici) */
+app.post("/api/friends/:userId", auth, (req, res) => {
+  const other = relationTarget(req, res); if (!other) return;
+  const me = req.user.id;
+  if (isBlockedEither(me, other)) return res.status(403).json({ error: "Azione non disponibile" });
+  const [a, b] = pairIds(me, other);
+  const existing = getFriendship(me, other);
+  if (!existing) {
+    db.prepare("INSERT INTO friendships (user_a, user_b, requester_id, status, created_at) VALUES (?,?,?,?,?)")
+      .run(a, b, me, "pending", nowMs());
+  } else if (existing.status === "pending" && existing.requester_id !== me) {
+    db.prepare("UPDATE friendships SET status = 'accepted' WHERE user_a = ? AND user_b = ?").run(a, b);
+  }
+  relationsChanged(me, other);
+  res.json({ ok: true });
+});
+
+app.post("/api/friends/:userId/accept", auth, (req, res) => {
+  const other = relationTarget(req, res); if (!other) return;
+  const me = req.user.id;
+  const f = getFriendship(me, other);
+  if (!f || f.status !== "pending" || f.requester_id === me)
+    return res.status(404).json({ error: "Nessuna richiesta da accettare" });
+  const [a, b] = pairIds(me, other);
+  db.prepare("UPDATE friendships SET status = 'accepted' WHERE user_a = ? AND user_b = ?").run(a, b);
+  relationsChanged(me, other);
+  res.json({ ok: true });
+});
+
+/* rimuove un amico, rifiuta una richiesta ricevuta o annulla una inviata */
+app.delete("/api/friends/:userId", auth, (req, res) => {
+  const other = relationTarget(req, res); if (!other) return;
+  const [a, b] = pairIds(req.user.id, other);
+  db.prepare("DELETE FROM friendships WHERE user_a = ? AND user_b = ?").run(a, b);
+  relationsChanged(req.user.id, other);
+  res.json({ ok: true });
+});
+
+/* blocco: chiude l'amicizia, impedisce DM e visibilità reciproca */
+app.post("/api/blocks/:userId", auth, (req, res) => {
+  const other = relationTarget(req, res); if (!other) return;
+  const me = req.user.id;
+  const [a, b] = pairIds(me, other);
+  db.transaction(() => {
+    db.prepare("INSERT OR IGNORE INTO blocks (blocker_id, blocked_id, created_at) VALUES (?,?,?)").run(me, other, nowMs());
+    db.prepare("DELETE FROM friendships WHERE user_a = ? AND user_b = ?").run(a, b);
+  })();
+  relationsChanged(me, other);
+  res.json({ ok: true });
+});
+app.delete("/api/blocks/:userId", auth, (req, res) => {
+  const other = relationTarget(req, res); if (!other) return;
+  db.prepare("DELETE FROM blocks WHERE blocker_id = ? AND blocked_id = ?").run(req.user.id, other);
+  relationsChanged(req.user.id, other);
+  res.json({ ok: true });
+});
+
+/* silenzia: solo per me, l'altro non viene avvisato */
+app.post("/api/mutes/:userId", auth, (req, res) => {
+  const other = relationTarget(req, res); if (!other) return;
+  db.prepare("INSERT OR IGNORE INTO mutes (user_id, muted_id, created_at) VALUES (?,?,?)").run(req.user.id, other, nowMs());
+  res.json({ ok: true });
+});
+app.delete("/api/mutes/:userId", auth, (req, res) => {
+  const other = relationTarget(req, res); if (!other) return;
+  db.prepare("DELETE FROM mutes WHERE user_id = ? AND muted_id = ?").run(req.user.id, other);
+  res.json({ ok: true });
+});
+
 /* ————————————————— DM ————————————————— */
 
 app.post("/api/dms/:otherUserId", auth, (req, res) => {
   const other = db.prepare("SELECT id FROM users WHERE id = ? AND verified = 1").get(req.params.otherUserId);
   if (!other) return res.status(404).json({ error: "Utente non trovato" });
+  if (other.id === req.user.id) return res.status(400).json({ error: "Non puoi scrivere a te stesso" });
+  if (isBlockedEither(req.user.id, other.id))
+    return res.status(403).json({ error: "Non puoi scrivere a questo utente." });
   const [a, b] = [req.user.id, other.id].sort();
   let dm = db.prepare("SELECT * FROM dms WHERE user_a = ? AND user_b = ?").get(a, b);
   if (!dm) {
-    dm = { id: `dm-${uid()}`, user_a: a, user_b: b, created_at: nowMs() };
-    db.prepare("INSERT INTO dms (id, user_a, user_b, created_at) VALUES (?,?,?,?)")
-      .run(dm.id, a, b, dm.created_at);
+    dm = { id: `dm-${uid()}`, user_a: a, user_b: b, creator_id: req.user.id, created_at: nowMs() };
+    db.prepare("INSERT INTO dms (id, user_a, user_b, creator_id, created_at) VALUES (?,?,?,?,?)")
+      .run(dm.id, a, b, dm.creator_id, dm.created_at);
   }
   res.json(dm);
 });
 
+/* le mie conversazioni: quelle che ho aperto io, più quelle in cui qualcuno
+   mi ha già scritto (le DM vuote aperte da altri non compaiono) */
 app.get("/api/dms", auth, (req, res) => {
-  const list = db.prepare("SELECT * FROM dms WHERE user_a = ? OR user_b = ?").all(req.user.id, req.user.id);
-  /* aggiunge i dati dell'altro utente per mostrare nome/avatar in lista */
-  const enriched = list.map((dm) => {
-    const otherId = dm.user_a === req.user.id ? dm.user_b : dm.user_a;
-    const other = db.prepare("SELECT id, name, handle, avatar FROM users WHERE id = ?").get(otherId);
-    return { ...dm, other };
-  });
+  const me = req.user.id;
+  const list = db.prepare(`
+    SELECT d.*,
+      (SELECT COUNT(*) FROM messages m WHERE m.room_id = d.id) AS msg_count,
+      (SELECT MAX(m.created_at) FROM messages m WHERE m.room_id = d.id) AS last_at
+    FROM dms d WHERE d.user_a = ? OR d.user_b = ?
+  `).all(me, me);
+  const enriched = list
+    .filter((dm) => dm.creator_id === me || dm.msg_count > 0)
+    .map((dm) => ({ ...dm, other: userSummary(dm.user_a === me ? dm.user_b : dm.user_a) }))
+    .filter((dm) => dm.other)
+    .sort((x, y) => (y.last_at || y.created_at) - (x.last_at || x.created_at));
   res.json(enriched);
 });
 
@@ -515,7 +713,12 @@ io.use((socket, next) => {
 });
 
 io.on("connection", (socket) => {
+  /* ogni utente registrato entra nella sua "stanza personale": serve per
+     recapitargli le DM e gli aggiornamenti anche se non ha quella chat aperta */
+  if (!socket.data.guest) socket.join(`user:${socket.data.user.id}`);
+
   socket.on("join", ({ roomId }) => {
+    if (typeof roomId !== "string") return;
     const room = db.prepare("SELECT * FROM rooms WHERE id = ?").get(roomId);
     const isDm = roomId.startsWith("dm-");
     if (isDm) {
@@ -532,14 +735,19 @@ io.on("connection", (socket) => {
   });
 
   socket.on("message", ({ roomId, text, image, sensitive }) => {
+    if (typeof roomId !== "string") return;
     const isDm = roomId.startsWith("dm-");
+    let dmRow = null;
 
     if (isDm) {
       /* le DM richiedono sempre un utente registrato e partecipante */
       if (socket.data.guest) return socket.emit("errorMsg", "Registrati per scrivere");
-      const dm = db.prepare("SELECT * FROM dms WHERE id = ?").get(roomId);
-      if (!dm || (dm.user_a !== socket.data.user.id && dm.user_b !== socket.data.user.id))
+      dmRow = db.prepare("SELECT * FROM dms WHERE id = ?").get(roomId);
+      if (!dmRow || (dmRow.user_a !== socket.data.user.id && dmRow.user_b !== socket.data.user.id))
         return socket.emit("errorMsg", "DM non trovata");
+      const otherId = dmRow.user_a === socket.data.user.id ? dmRow.user_b : dmRow.user_a;
+      if (isBlockedEither(socket.data.user.id, otherId))
+        return socket.emit("errorMsg", "Non puoi inviare messaggi a questo utente.");
     } else {
       const room = db.prepare("SELECT * FROM rooms WHERE id = ?").get(roomId);
       if (!room) return;
@@ -571,7 +779,14 @@ io.on("connection", (socket) => {
       db.prepare("INSERT INTO messages (id, room_id, user_id, text, image, sensitive, created_at) VALUES (?,?,?,?,?,?,?)")
         .run(msg.id, msg.room_id, msg.user_id, msg.text, msg.image, msg.sensitive, msg.created_at);
     }
-    io.to(roomId).emit("message", { ...msg, ...u });
+    const payload = { ...msg, ...u };
+    if (isDm) {
+      /* arriva a tutte le sessioni di entrambi i partecipanti: chi riceve la
+         DM la vede comparire in lista anche senza aver aperto quella chat */
+      io.to(`user:${dmRow.user_a}`).to(`user:${dmRow.user_b}`).emit("message", payload);
+    } else {
+      io.to(roomId).emit("message", payload);
+    }
   });
 
   socket.on("leave", ({ roomId }) => socket.leave(roomId));
