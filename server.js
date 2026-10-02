@@ -81,7 +81,12 @@ async function sendVerificationEmail(to, code) {
 }
 
 /* ———— database ———— */
-const db = new Database(path.join(__dirname, "foyer.db"));
+/* Dove salvare database e foto. Senza DATA_DIR usa la cartella del codice (come prima).
+   Su un servizio con disco persistente si imposta DATA_DIR sul percorso del disco
+   (es. /var/data): così database e foto sopravvivono a riavvii e deploy. */
+const DATA_DIR = process.env.DATA_DIR || __dirname;
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+const db = new Database(path.join(DATA_DIR, "foyer.db"));
 db.pragma("journal_mode = WAL");
 
 db.exec(`
@@ -172,6 +177,13 @@ CREATE TABLE IF NOT EXISTS mutes (
   created_at INTEGER NOT NULL,
   PRIMARY KEY (user_id, muted_id)
 );
+CREATE TABLE IF NOT EXISTS swipes (
+  swiper_id TEXT NOT NULL,
+  target_id TEXT NOT NULL,
+  action TEXT NOT NULL, -- 'like' | 'pass'
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (swiper_id, target_id)
+);
 `);
 
 /* se il database esiste già (es. disco persistente), CREATE TABLE IF NOT EXISTS
@@ -203,7 +215,7 @@ app.use(cors({ origin: corsOriginCheck }));
 app.use(express.json({ limit: "1mb" }));
 
 /* upload foto su disco */
-const uploadDir = path.join(__dirname, "uploads");
+const uploadDir = path.join(DATA_DIR, "uploads");
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
 const storage = multer.diskStorage({
   destination: uploadDir,
@@ -449,10 +461,60 @@ app.put("/api/me/prompts", auth, (req, res) => {
 /* elenco persone (feed) */
 app.get("/api/people", auth, (req, res) => {
   const me = req.user.id;
-  const users = db.prepare("SELECT * FROM users WHERE verified = 1 AND id != ? ORDER BY created_at DESC LIMIT 50").all(me);
-  /* chi ha bloccato me (o è stato bloccato da me) non compare; per ognuno
-     si applicano privacy e foto "solo amici" lato server */
-  res.json(users.filter((u) => !isBlockedEither(me, u.id)).map((u) => profileFor(u, me)));
+  /* lo swipe (like/pass) è una decisione presa UNA volta: chi ho già
+     valutato non torna più nel mazzo */
+  const already = new Set(db.prepare("SELECT target_id FROM swipes WHERE swiper_id = ?").all(me).map((r) => r.target_id));
+  const users = db.prepare("SELECT * FROM users WHERE verified = 1 AND id != ? ORDER BY created_at DESC LIMIT 100").all(me);
+  res.json(users.filter((u) => !already.has(u.id) && !isBlockedEither(me, u.id)).map((u) => profileFor(u, me)));
+});
+
+/* registra un like o un pass; se è un like reciproco, è un match */
+app.post("/api/swipes/:userId", auth, (req, res) => {
+  const other = relationTarget(req, res); if (!other) return;
+  const me = req.user.id;
+  if (isBlockedEither(me, other)) return res.status(403).json({ error: "Azione non disponibile" });
+  const { action } = req.body || {};
+  if (action !== "like" && action !== "pass") return res.status(400).json({ error: "Azione non valida" });
+
+  db.prepare(`INSERT INTO swipes (swiper_id, target_id, action, created_at) VALUES (?,?,?,?)
+              ON CONFLICT(swiper_id, target_id) DO UPDATE SET action = excluded.action, created_at = excluded.created_at`)
+    .run(me, other, action, nowMs());
+
+  let match = false;
+  if (action === "like") {
+    const theirs = db.prepare("SELECT action FROM swipes WHERE swiper_id = ? AND target_id = ?").get(other, me);
+    if (theirs && theirs.action === "like") {
+      match = true;
+      /* l'altro potrebbe non essere connesso in questo momento; lo saprà
+         al prossimo accesso, e in tempo reale se lo è */
+      notifyUser(other, "match-changed");
+    }
+  }
+  res.json({ ok: true, match });
+});
+
+/* chi mi ha messo like e non ho ancora valutato (si riduce quando rispondo) */
+app.get("/api/swipes/likes-me", auth, (req, res) => {
+  const me = req.user.id;
+  const rows = db.prepare(`
+    SELECT s.swiper_id AS id FROM swipes s
+    WHERE s.target_id = ? AND s.action = 'like'
+      AND NOT EXISTS (SELECT 1 FROM swipes s2 WHERE s2.swiper_id = ? AND s2.target_id = s.swiper_id)
+    ORDER BY s.created_at DESC
+  `).all(me, me);
+  res.json(rows.map((r) => userSummary(r.id)).filter((u) => u && !isBlockedEither(me, u.id)));
+});
+
+/* i miei match: like reciproci */
+app.get("/api/swipes/matches", auth, (req, res) => {
+  const me = req.user.id;
+  const rows = db.prepare(`
+    SELECT s.target_id AS id FROM swipes s
+    WHERE s.swiper_id = ? AND s.action = 'like'
+      AND EXISTS (SELECT 1 FROM swipes s2 WHERE s2.swiper_id = s.target_id AND s2.target_id = ? AND s2.action = 'like')
+    ORDER BY s.created_at DESC
+  `).all(me, me);
+  res.json(rows.map((r) => userSummary(r.id)).filter((u) => u && !isBlockedEither(me, u.id)));
 });
 
 app.get("/api/people/:id", auth, (req, res) => {
@@ -712,10 +774,31 @@ io.use((socket, next) => {
   }
 });
 
+/* chi è davvero connesso in questo momento: id utente → quante schede/dispositivi
+   ha aperti (così non risulta "offline" chiudendo una sola scheda su più aperte) */
+const onlineCounts = new Map();
+function isOnline(id) { return (onlineCounts.get(id) || 0) > 0; }
+
+app.get("/api/online", auth, (req, res) => {
+  res.json([...onlineCounts.keys()].filter((id) => onlineCounts.get(id) > 0));
+});
+
 io.on("connection", (socket) => {
   /* ogni utente registrato entra nella sua "stanza personale": serve per
      recapitargli le DM e gli aggiornamenti anche se non ha quella chat aperta */
-  if (!socket.data.guest) socket.join(`user:${socket.data.user.id}`);
+  if (!socket.data.guest) {
+    const me = socket.data.user.id;
+    socket.join(`user:${me}`);
+    const wasOffline = !isOnline(me);
+    onlineCounts.set(me, (onlineCounts.get(me) || 0) + 1);
+    if (wasOffline) io.emit("presence", { userId: me, online: true });
+
+    socket.on("disconnect", () => {
+      const left = (onlineCounts.get(me) || 1) - 1;
+      onlineCounts.set(me, Math.max(0, left));
+      if (left <= 0) io.emit("presence", { userId: me, online: false });
+    });
+  }
 
   socket.on("join", ({ roomId }) => {
     if (typeof roomId !== "string") return;
@@ -795,6 +878,9 @@ io.on("connection", (socket) => {
 /* ———— avvio ———— */
 httpServer.listen(PORT, () => {
   console.log(`Foyer backend in ascolto sulla porta ${PORT}`);
+  console.log(process.env.DATA_DIR
+    ? `Dati salvati in ${DATA_DIR} (disco persistente: gli account restano dopo riavvii e deploy)`
+    : "⚠ DATA_DIR non impostata: database e foto stanno su disco temporaneo e si cancellano a ogni riavvio/deploy");
   if (!RESEND_API_KEY) console.log("⚠ RESEND_API_KEY non impostata: i codici email vengono stampati qui nel log");
   if (JWT_SECRET === "cambiami-in-produzione") console.log("⚠ JWT_SECRET di default: impostane uno vero prima di andare online");
 });
