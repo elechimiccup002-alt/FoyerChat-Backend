@@ -677,7 +677,8 @@ app.put("/api/me/prompts", auth, (req, res) => {
   res.json({ ok: true });
 });
 
-/* elenco persone (la griglia): a pagine, dal più recente. Il cursore è opaco per il
+/* elenco persone (la griglia): a pagine, dal più recente. Chi ho scartato con la X
+   non compare più; chi ho messo "mi piace" resta, segnato. Il cursore è opaco per il
    client. Con il gate età attivo compaiono solo persone verificate: la griglia è il
    posto dove adulti verificati incontrano altri adulti verificati. */
 app.get("/api/people", auth, requireVerified, (req, res) => {
@@ -691,10 +692,12 @@ app.get("/api/people", auth, requireVerified, (req, res) => {
   const gate = AGE_GATE ? 1 : 0;
   const rows = cur && Number.isFinite(cur.t) && typeof cur.i === "string"
     ? db.prepare(`SELECT * FROM users WHERE verified = 1 AND id != ? AND (? = 0 OR age_verified = 1)
+                  AND id NOT IN (SELECT target_id FROM swipes WHERE swiper_id = ? AND action = 'pass')
                   AND (created_at < ? OR (created_at = ? AND id < ?)) ORDER BY created_at DESC, id DESC LIMIT ?`)
-        .all(me, gate, cur.t, cur.t, cur.i, limit + 1)
+        .all(me, gate, me, cur.t, cur.t, cur.i, limit + 1)
     : db.prepare(`SELECT * FROM users WHERE verified = 1 AND id != ? AND (? = 0 OR age_verified = 1)
-                  ORDER BY created_at DESC, id DESC LIMIT ?`).all(me, gate, limit + 1);
+                  AND id NOT IN (SELECT target_id FROM swipes WHERE swiper_id = ? AND action = 'pass')
+                  ORDER BY created_at DESC, id DESC LIMIT ?`).all(me, gate, me, limit + 1);
 
   const hasMore = rows.length > limit;
   const page = rows.slice(0, limit);
@@ -742,12 +745,15 @@ app.post("/api/swipes/:userId", auth, requireVerified, (req, res) => {
 app.get("/api/swipes/likes-me", auth, requireVerified, (req, res) => {
   const me = req.user.id;
   const rows = db.prepare(`
-    SELECT s.swiper_id AS id FROM swipes s
+    SELECT s.swiper_id AS id,
+      EXISTS (SELECT 1 FROM dm_requests r WHERE r.from_id = s.swiper_id AND r.to_id = ? AND r.rose = 1 AND r.status = 'pending') AS rose
+    FROM swipes s
     WHERE s.target_id = ? AND s.action = 'like'
       AND NOT EXISTS (SELECT 1 FROM swipes s2 WHERE s2.swiper_id = ? AND s2.target_id = s.swiper_id)
-    ORDER BY s.created_at DESC
-  `).all(me, me);
-  res.json(rows.map((r) => userSummary(r.id)).filter((u) => u && !isBlockedEither(me, u.id)));
+    ORDER BY rose DESC, s.created_at DESC
+  `).all(me, me, me);
+  res.json(rows.map((r) => { const u = userSummary(r.id); return u ? { ...u, rose: !!r.rose } : null; })
+    .filter((u) => u && !isBlockedEither(me, u.id)));
 });
 
 /* i miei match: like reciproci */
@@ -1013,6 +1019,16 @@ app.post("/api/dm-requests/:userId", auth, requireVerified, (req, res) => {
   if (outgoing?.status === "pending") return res.status(409).json({ error: "Hai già inviato una richiesta a questa persona" });
   if (outgoing?.status === "declined") return res.status(403).json({ error: "Questa persona non ha accettato la tua richiesta" });
 
+  /* la rosa è anche un "mi piace". Se la persona mi aveva già messo like non serve
+     pagare priorità: il mio like crea direttamente il match e si apre la chat */
+  if (rose && db.prepare("SELECT 1 FROM swipes WHERE swiper_id = ? AND target_id = ? AND action = 'like'").get(other, me)) {
+    db.prepare(`INSERT INTO swipes (swiper_id, target_id, action, created_at) VALUES (?,?,?,?)
+                ON CONFLICT(swiper_id, target_id) DO UPDATE SET action = 'like', created_at = excluded.created_at`)
+      .run(me, other, "like", nowMs());
+    notifyUser(other, "match-changed");
+    return res.json({ ok: true, dm: openDmChannel(me, other), matched: true });
+  }
+
   /* mi aveva già chiesto lei/lui: l'intenzione è reciproca, si apre subito */
   const incoming = getRequest(other, me);
   if (incoming?.status === "pending") {
@@ -1039,6 +1055,12 @@ app.post("/api/dm-requests/:userId", auth, requireVerified, (req, res) => {
     }
     db.prepare("INSERT INTO dm_requests (from_id, to_id, status, rose, cost, created_at) VALUES (?,?,?,?,?,?)")
       .run(me, other, "pending", rose ? 1 : 0, rose ? ROSE_COST : 0, nowMs());
+    if (rose) {
+      /* la rosa mette anche "mi piace": è così che finisce in cima a "chi ti ha messo like" */
+      db.prepare(`INSERT INTO swipes (swiper_id, target_id, action, created_at) VALUES (?,?,?,?)
+                  ON CONFLICT(swiper_id, target_id) DO UPDATE SET action = 'like', created_at = excluded.created_at`)
+        .run(me, other, "like", nowMs());
+    }
     return true;
   })();
   if (!ok) return res.status(402).json({ error: "Saldo insufficiente per inviare una rosa" });
@@ -1076,6 +1098,10 @@ app.post("/api/dm-requests/:userId/decline", auth, (req, res) => {
   const r = getRequest(other, req.user.id);
   if (!r || r.status !== "pending") return res.status(404).json({ error: "Nessuna richiesta da rifiutare" });
   db.prepare("UPDATE dm_requests SET status = 'declined' WHERE from_id = ? AND to_id = ?").run(other, req.user.id);
+  /* rifiutare equivale a scartare: la persona esce dai miei like ricevuti e dalla mia griglia.
+     (un mio eventuale "mi piace" precedente non viene toccato) */
+  db.prepare("INSERT OR IGNORE INTO swipes (swiper_id, target_id, action, created_at) VALUES (?,?,?,?)")
+    .run(req.user.id, other, "pass", nowMs());
   notifyUser(req.user.id, "dm-request-accepted"); // solo per far ricaricare l'elenco a chi ha rifiutato
   res.json({ ok: true });
 });
