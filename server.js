@@ -29,6 +29,27 @@ const PORT = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET || "cambiami-in-produzione";
 const RESEND_API_KEY = process.env.RESEND_API_KEY || null;
 
+/* Verifica età con Yoti (opzionale): senza queste due variabili, l'endpoint
+   di avvio verifica risponde chiaramente "non configurato" invece di fingere
+   che funzioni. Si ottengono da hub.yoti.com dopo aver verificato l'azienda. */
+const YOTI_SDK_ID = process.env.YOTI_SDK_ID || null;
+const YOTI_API_KEY = process.env.YOTI_API_KEY || null;
+const YOTI_AGE_THRESHOLD = parseInt(process.env.YOTI_AGE_THRESHOLD || "18", 10);
+const YOTI_BASE = "https://age.yoti.com/api/v1";
+/* l'indirizzo pubblico di QUESTO backend (es. https://foyerchat-backend-1.onrender.com),
+   serve a Yoti per sapere dove mandare l'avviso di fine verifica */
+const PUBLIC_URL = (process.env.PUBLIC_URL || "").replace(/\/+$/, "");
+
+/* "Gate età": quando è attivo, Persone, richieste di messaggio, DM e stanza rosa
+   richiedono la verifica dell'età (Yoti). Si attiva da solo quando Yoti è
+   configurato; si può forzare con ENFORCE_AGE_GATE=true. Senza né l'uno né
+   l'altro resta spento (fase di prova) e all'avvio lo dice chiaramente. */
+const AGE_GATE = process.env.ENFORCE_AGE_GATE === "true" || !!(YOTI_SDK_ID && YOTI_API_KEY);
+
+/* la rosa: richiesta di messaggio con priorità, a pagamento (saldo simulato per ora) */
+const ROSE_COST = 1.99;
+const MAX_REQUESTS_PER_DAY = 30; // richieste di messaggio nuove al giorno per persona (anti-spam)
+
 /* FRONTEND_URL può contenere PIÙ indirizzi separati da virgola
    (es. il sito su Netlify E quello su Cloudflare insieme).
    Ogni indirizzo viene ripulito da spazi e dallo slash finale,
@@ -105,6 +126,9 @@ CREATE TABLE IF NOT EXISTS users (
   streak INTEGER DEFAULT 1,
   private INTEGER DEFAULT 0,
   gender TEXT NOT NULL DEFAULT 'M',
+  tokens REAL NOT NULL DEFAULT 10,
+  age_verified INTEGER NOT NULL DEFAULT 0,
+  dm_private INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS verification_codes (
@@ -116,6 +140,8 @@ CREATE TABLE IF NOT EXISTS photos (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   filename TEXT NOT NULL,
+  thumb_filename TEXT DEFAULT '',
+  blur_filename TEXT DEFAULT '',
   position INTEGER DEFAULT 0,
   friends_only INTEGER DEFAULT 0,
   created_at INTEGER NOT NULL
@@ -177,6 +203,21 @@ CREATE TABLE IF NOT EXISTS mutes (
   created_at INTEGER NOT NULL,
   PRIMARY KEY (user_id, muted_id)
 );
+CREATE TABLE IF NOT EXISTS age_verification_sessions (
+  session_id TEXT PRIMARY KEY,  -- id generato da Yoti
+  user_id TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending', -- pending | complete | failed
+  created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS dm_requests (
+  from_id TEXT NOT NULL,
+  to_id TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending', -- pending | accepted | declined
+  rose INTEGER NOT NULL DEFAULT 0,
+  cost REAL NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (from_id, to_id)
+);
 CREATE TABLE IF NOT EXISTS swipes (
   swiper_id TEXT NOT NULL,
   target_id TEXT NOT NULL,
@@ -196,6 +237,11 @@ ensureColumn("users", "private", "INTEGER DEFAULT 0");
 ensureColumn("users", "gender", "TEXT NOT NULL DEFAULT 'M'");
 ensureColumn("photos", "friends_only", "INTEGER DEFAULT 0");
 ensureColumn("dms", "creator_id", "TEXT DEFAULT ''");
+ensureColumn("users", "tokens", "REAL NOT NULL DEFAULT 10");
+ensureColumn("users", "age_verified", "INTEGER NOT NULL DEFAULT 0");
+ensureColumn("users", "dm_private", "INTEGER NOT NULL DEFAULT 0");
+ensureColumn("photos", "thumb_filename", "TEXT DEFAULT ''");
+ensureColumn("photos", "blur_filename", "TEXT DEFAULT ''");
 
 /* stanze di default */
 const seedRooms = db.prepare("SELECT COUNT(*) AS n FROM rooms").get();
@@ -280,36 +326,122 @@ function userSummary(id) {
 }
 function notifyUser(userId, event) { io.to(`user:${userId}`).emit(event); }
 
+/* ————————————————— VERIFICA ETÀ / MATCH / RICHIESTE (helper) ————————————————— */
+
+/* con il gate spento (nessun Yoti configurato) tutti risultano "a posto" */
+function isVerified(userId) {
+  if (!AGE_GATE) return true;
+  return !!db.prepare("SELECT age_verified FROM users WHERE id = ?").get(userId)?.age_verified;
+}
+const AGE_GATE_ERROR = { error: "Per usare questa funzione devi prima verificare la tua età.", code: "AGE_GATE" };
+function requireVerified(req, res, next) {
+  if (!isVerified(req.user.id)) return res.status(403).json(AGE_GATE_ERROR);
+  next();
+}
+
+/* like reciproco */
+function areMatched(x, y) {
+  const n = db.prepare("SELECT COUNT(*) AS n FROM swipes WHERE action = 'like' AND ((swiper_id = ? AND target_id = ?) OR (swiper_id = ? AND target_id = ?))")
+    .get(x, y, y, x).n;
+  return n === 2;
+}
+function getDm(x, y) {
+  const [a, b] = pairIds(x, y);
+  return db.prepare("SELECT * FROM dms WHERE user_a = ? AND user_b = ?").get(a, b);
+}
+function getRequest(fromId, toId) {
+  return db.prepare("SELECT * FROM dm_requests WHERE from_id = ? AND to_id = ?").get(fromId, toId);
+}
+
+/* apre la conversazione tra due persone. "visibleTo" decide chi la vede in elenco
+   finché è vuota: "both" per le richieste accettate (entrambi hanno acconsentito),
+   l'id di chi l'ha aperta quando è un amico/match che clicca "Scrivi" (l'altro la
+   vedrà solo al primo messaggio, senza conversazioni vuote che compaiono dal nulla) */
+function openDmChannel(x, y, visibleTo = "both") {
+  let dm = getDm(x, y);
+  if (!dm) {
+    const [a, b] = pairIds(x, y);
+    dm = { id: `dm-${uid()}`, user_a: a, user_b: b, creator_id: visibleTo, created_at: nowMs() };
+    db.prepare("INSERT INTO dms (id, user_a, user_b, creator_id, created_at) VALUES (?,?,?,?,?)")
+      .run(dm.id, a, b, dm.creator_id, dm.created_at);
+  }
+  return dm;
+}
+
+/* si può scrivere subito (senza richiesta) se c'è già un canale, o amicizia, o match,
+   o una richiesta accettata */
+function canOpenDirect(x, y) {
+  if (getDm(x, y)) return true;
+  if (areFriends(x, y) || areMatched(x, y)) return true;
+  return getRequest(x, y)?.status === "accepted" || getRequest(y, x)?.status === "accepted";
+}
+
+/* Come posso contattare questa persona? Una sola fonte di verità per il client:
+   self | open | request | rose | pending | incoming | closed */
+function contactState(me, u) {
+  if (u.id === me) return "self";
+  if (isBlockedEither(me, u.id)) return "closed";
+  if (AGE_GATE && !u.age_verified) return "closed";
+  if (canOpenDirect(me, u.id)) return "open";
+  const out = getRequest(me, u.id);
+  if (out?.status === "pending") return "pending";
+  if (out?.status === "declined") return "closed";   // niente nuovi tentativi (né a pagamento)
+  const inc = getRequest(u.id, me);
+  if (inc?.status === "pending") return "incoming";  // mi ha già chiesto lui: basta accettare
+  return u.dm_private ? "rose" : "request";
+}
+
 /* Profilo "completo" così come lo vede chi lo guarda (viewerId).
-   - il titolare vede tutto, comprese le foto "solo amici"
-   - gli amici accettati vedono tutto
-   - tutti gli altri NON ricevono proprio le foto "solo amici" (filtrate qui,
-     lato server, quindi non compaiono né nel profilo né nello swipe) */
+   - il titolare e gli amici accettati vedono tutte le foto
+   - agli altri le foto "sfocate dal titolare" arrivano SOLO come versione sfocata
+     (un file a parte, minuscolo): l'originale e la miniatura non vengono mai
+     inviati, quindi non si possono recuperare con gli strumenti del browser */
 function publicUser(u, viewerId = u.id) {
   const seesAll = viewerId === u.id || areFriends(u.id, viewerId);
-  let photos = db.prepare("SELECT id, filename, position, friends_only FROM photos WHERE user_id = ? ORDER BY position").all(u.id);
-  if (!seesAll) photos = photos.filter((p) => !p.friends_only);
+  const rows = db.prepare("SELECT id, filename, thumb_filename, blur_filename, position, friends_only FROM photos WHERE user_id = ? ORDER BY position").all(u.id);
+  const photos = rows.map((p) => {
+    if (p.friends_only && !seesAll) {
+      return { id: p.id, hidden: true, blur: p.blur_filename ? `/uploads/${p.blur_filename}` : null };
+    }
+    return {
+      id: p.id, hidden: false,
+      url: `/uploads/${p.filename}`,
+      thumb: `/uploads/${p.thumb_filename || p.filename}`,
+      friends_only: !!p.friends_only,
+    };
+  });
   const prompts = db.prepare("SELECT question, answer FROM prompts WHERE user_id = ? ORDER BY position").all(u.id);
   return {
     /* "name" coincide sempre col nickname: in registrazione non si chiede
        più un nome separato, solo il nickname (handle) */
     id: u.id, name: u.handle, age: u.age, handle: u.handle, city: u.city, gender: u.gender,
+    age_verified: !!u.age_verified,
     bio: u.bio, vibe: u.vibe, avatar: u.avatar, streak: u.streak, private: !!u.private,
+    dm_private: !!u.dm_private,
     friend_count: friendCount(u.id),
-    photos: photos.map((p) => ({ id: p.id, url: `/uploads/${p.filename}`, friends_only: !!p.friends_only })),
+    photos,
     prompts: prompts.map((p) => [p.question, p.answer]),
   };
 }
 
-/* Come publicUser, ma rispetta il profilo privato: chi non è il titolare né
-   un suo amico vede solo nickname, età e genere (niente foto, bio, prompt) */
+/* Come publicUser, ma con le regole di accesso al profilo:
+   - profilo privato: chi non è il titolare né un suo amico vede solo nickname/età/genere
+   - con il gate età attivo, un profilo NON verificato è visibile così solo a se stesso:
+     potrebbe appartenere a un minorenne, quindi nessuno vede le sue foto o la sua bio */
 function profileFor(u, viewerId) {
-  if (u.private && u.id !== viewerId && !areFriends(u.id, viewerId)) {
-    /* "restricted" = questa è una vista limitata (il client mostra il lucchetto);
-       "private" è invece l'impostazione del profilo, presente anche nella vista completa */
-    return { id: u.id, name: u.handle, handle: u.handle, age: u.age, gender: u.gender, private: true, restricted: true };
+  const unverified = AGE_GATE && !u.age_verified && u.id !== viewerId;
+  const privateBlocked = u.private && u.id !== viewerId && !areFriends(u.id, viewerId);
+  let out;
+  if (unverified || privateBlocked) {
+    /* "restricted" = vista limitata (il client mostra il lucchetto); "private" è invece
+       l'impostazione del profilo, presente anche nella vista completa */
+    out = { id: u.id, name: u.handle, handle: u.handle, age: u.age, gender: u.gender, age_verified: !!u.age_verified,
+            dm_private: !!u.dm_private, private: !!u.private, restricted: true, unverified };
+  } else {
+    out = publicUser(u, viewerId);
   }
-  return publicUser(u, viewerId);
+  out.contact = contactState(viewerId, u);
+  return out;
 }
 
 /* ————————————————— AUTH ————————————————— */
@@ -419,14 +551,15 @@ app.post("/api/auth/login", (req, res) => {
 app.get("/api/me", auth, (req, res) => {
   const u = db.prepare("SELECT * FROM users WHERE id = ?").get(req.user.id);
   if (!u) return res.status(404).json({ error: "Utente non trovato" });
-  res.json({ ...publicUser(u), email: u.email });
+  res.json({ ...publicUser(u), email: u.email, tokens: u.tokens, age_gate: AGE_GATE });
 });
 
 app.patch("/api/me", auth, (req, res) => {
-  const { bio, vibe, city, avatar, private: priv } = req.body || {};
+  const { bio, vibe, city, avatar, private: priv, dm_private: dmPriv } = req.body || {};
   const privValue = priv === undefined ? null : (priv ? 1 : 0);
-  db.prepare("UPDATE users SET bio = COALESCE(?, bio), vibe = COALESCE(?, vibe), city = COALESCE(?, city), avatar = COALESCE(?, avatar), private = COALESCE(?, private) WHERE id = ?")
-    .run(bio ?? null, vibe ?? null, city ?? null, avatar ?? null, privValue, req.user.id);
+  const dmPrivValue = dmPriv === undefined ? null : (dmPriv ? 1 : 0);
+  db.prepare("UPDATE users SET bio = COALESCE(?, bio), vibe = COALESCE(?, vibe), city = COALESCE(?, city), avatar = COALESCE(?, avatar), private = COALESCE(?, private), dm_private = COALESCE(?, dm_private) WHERE id = ?")
+    .run(bio ?? null, vibe ?? null, city ?? null, avatar ?? null, privValue, dmPrivValue, req.user.id);
   const u = db.prepare("SELECT * FROM users WHERE id = ?").get(req.user.id);
   io.emit("people-changed"); // chi ha aperto "Persone" ricarica subito il feed
   res.json(publicUser(u));
@@ -440,6 +573,92 @@ app.post("/api/me/avatar", auth, upload.single("avatar"), (req, res) => {
   db.prepare("UPDATE users SET avatar = ? WHERE id = ?").run(url, req.user.id);
   io.emit("people-changed");
   res.json({ avatar: url });
+});
+
+/* ————————————————— VERIFICA ETÀ (Yoti) ————————————————— */
+
+/* chiede a Yoti il risultato vero di una sessione, usando la NOSTRA chiave
+   API come fonte di verità — non ci si fida mai del solo corpo del webhook */
+async function fetchYotiResult(sessionId) {
+  const res = await fetch(`${YOTI_BASE}/sessions/${sessionId}/result`, {
+    headers: { Authorization: `Bearer ${YOTI_API_KEY}`, "Yoti-Sdk-Id": YOTI_SDK_ID },
+  });
+  if (!res.ok) throw new Error(`Yoti ha risposto ${res.status}`);
+  return res.json();
+}
+
+/* avvia una verifica: crea la sessione su Yoti e restituisce l'indirizzo a
+   cui mandare la persona per completarla */
+app.post("/api/verify-age/start", auth, async (req, res) => {
+  if (!YOTI_SDK_ID || !YOTI_API_KEY)
+    return res.status(501).json({ error: "Verifica età non ancora configurata su questo server" });
+
+  const me = req.user.id;
+  const u = db.prepare("SELECT age_verified FROM users WHERE id = ?").get(me);
+  if (u?.age_verified) return res.json({ already: true });
+
+  try {
+    const ref = `${me}-${nowMs()}`;
+    const ySession = await fetch(`${YOTI_BASE}/sessions`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${YOTI_API_KEY}`,
+        "Yoti-Sdk-Id": YOTI_SDK_ID,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        type: "OVER",
+        age_estimation: { allowed: true, threshold: YOTI_AGE_THRESHOLD, level: "PASSIVE" },
+        ttl: 900,
+        reference_id: ref,
+        callback: { auto: true, url: `${FRONTEND_URLS[0] || ""}/?ageverify=done` },
+        notification_url: `${PUBLIC_URL}/api/verify-age/webhook`,
+      }),
+    }).then((r) => r.json());
+
+    if (!ySession?.id) return res.status(502).json({ error: "Risposta inattesa da Yoti" });
+
+    db.prepare("INSERT INTO age_verification_sessions (session_id, user_id, status, created_at) VALUES (?,?,?,?)")
+      .run(ySession.id, me, "pending", nowMs());
+
+    res.json({ url: ySession.user_tracking_url || ySession.url, sessionId: ySession.id });
+  } catch (e) {
+    console.error("Errore avvio verifica età:", e.message);
+    res.status(502).json({ error: "Impossibile contattare Yoti, riprova" });
+  }
+});
+
+/* Yoti chiama questo indirizzo quando una sessione si conclude. Lo trattiamo
+   solo come un "ricontrolla ora": il risultato vero lo chiediamo sempre
+   direttamente a Yoti con la nostra chiave, non ci fidiamo del corpo ricevuto. */
+app.post("/api/verify-age/webhook", async (req, res) => {
+  const sessionId = req.body?.session_id || req.body?.sessionId || req.body?.id;
+  if (!sessionId) return res.status(400).json({ error: "session_id mancante" });
+
+  const row = db.prepare("SELECT * FROM age_verification_sessions WHERE session_id = ?").get(sessionId);
+  if (!row) return res.status(404).json({ error: "Sessione sconosciuta" }); // non è un nostro invito: ignorata
+
+  try {
+    const result = await fetchYotiResult(sessionId);
+    const passed = result?.status === "COMPLETE" && result?.result !== false;
+    db.prepare("UPDATE age_verification_sessions SET status = ? WHERE session_id = ?")
+      .run(passed ? "complete" : "failed", sessionId);
+    if (passed) {
+      db.prepare("UPDATE users SET age_verified = 1 WHERE id = ?").run(row.user_id);
+      io.emit("people-changed");
+      notifyUser(row.user_id, "age-verified");
+    }
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("Errore verifica webhook Yoti:", e.message);
+    res.status(502).json({ error: "Impossibile confermare con Yoti" });
+  }
+});
+
+/* il mio stato attuale (per il pulsante nel profilo) */
+app.get("/api/verify-age/status", auth, (req, res) => {
+  const u = db.prepare("SELECT age_verified FROM users WHERE id = ?").get(req.user.id);
+  res.json({ verified: !!u?.age_verified, configured: !!(YOTI_SDK_ID && YOTI_API_KEY) });
 });
 
 /* prompt del profilo (max 3) */
@@ -458,21 +677,47 @@ app.put("/api/me/prompts", auth, (req, res) => {
   res.json({ ok: true });
 });
 
-/* elenco persone (feed) */
-app.get("/api/people", auth, (req, res) => {
+/* elenco persone (la griglia): a pagine, dal più recente. Il cursore è opaco per il
+   client. Con il gate età attivo compaiono solo persone verificate: la griglia è il
+   posto dove adulti verificati incontrano altri adulti verificati. */
+app.get("/api/people", auth, requireVerified, (req, res) => {
   const me = req.user.id;
-  /* lo swipe (like/pass) è una decisione presa UNA volta: chi ho già
-     valutato non torna più nel mazzo */
-  const already = new Set(db.prepare("SELECT target_id FROM swipes WHERE swiper_id = ?").all(me).map((r) => r.target_id));
-  const users = db.prepare("SELECT * FROM users WHERE verified = 1 AND id != ? ORDER BY created_at DESC LIMIT 100").all(me);
-  res.json(users.filter((u) => !already.has(u.id) && !isBlockedEither(me, u.id)).map((u) => profileFor(u, me)));
+  const q = req.query || {};
+  const limit = Math.min(Math.max(parseInt(q.limit, 10) || 36, 1), 60);
+  let cur = null;
+  if (q.cursor) {
+    try { cur = JSON.parse(Buffer.from(String(q.cursor), "base64url").toString("utf8")); } catch { cur = null; }
+  }
+  const gate = AGE_GATE ? 1 : 0;
+  const rows = cur && Number.isFinite(cur.t) && typeof cur.i === "string"
+    ? db.prepare(`SELECT * FROM users WHERE verified = 1 AND id != ? AND (? = 0 OR age_verified = 1)
+                  AND (created_at < ? OR (created_at = ? AND id < ?)) ORDER BY created_at DESC, id DESC LIMIT ?`)
+        .all(me, gate, cur.t, cur.t, cur.i, limit + 1)
+    : db.prepare(`SELECT * FROM users WHERE verified = 1 AND id != ? AND (? = 0 OR age_verified = 1)
+                  ORDER BY created_at DESC, id DESC LIMIT ?`).all(me, gate, limit + 1);
+
+  const hasMore = rows.length > limit;
+  const page = rows.slice(0, limit);
+  const next = hasMore
+    ? Buffer.from(JSON.stringify({ t: page[page.length - 1].created_at, i: page[page.length - 1].id })).toString("base64url")
+    : null;
+
+  const liked = new Set(db.prepare("SELECT target_id FROM swipes WHERE swiper_id = ? AND action = 'like'").all(me).map((r) => r.target_id));
+  /* i bloccati (in entrambe le direzioni) non compaiono; privacy e foto sfocate
+     sono applicate qui, lato server, per ogni persona */
+  const people = page
+    .filter((u) => !isBlockedEither(me, u.id))
+    .map((u) => ({ ...profileFor(u, me), liked: liked.has(u.id), matched: areMatched(me, u.id) }));
+  res.json({ people, next });
 });
 
-/* registra un like o un pass; se è un like reciproco, è un match */
-app.post("/api/swipes/:userId", auth, (req, res) => {
+/* mette "mi piace" (o passa); se il like è reciproco, è un match */
+app.post("/api/swipes/:userId", auth, requireVerified, (req, res) => {
   const other = relationTarget(req, res); if (!other) return;
   const me = req.user.id;
   if (isBlockedEither(me, other)) return res.status(403).json({ error: "Azione non disponibile" });
+  if (AGE_GATE && !db.prepare("SELECT age_verified FROM users WHERE id = ?").get(other)?.age_verified)
+    return res.status(403).json({ error: "Questa persona non ha ancora verificato l'età" });
   const { action } = req.body || {};
   if (action !== "like" && action !== "pass") return res.status(400).json({ error: "Azione non valida" });
 
@@ -494,7 +739,7 @@ app.post("/api/swipes/:userId", auth, (req, res) => {
 });
 
 /* chi mi ha messo like e non ho ancora valutato (si riduce quando rispondo) */
-app.get("/api/swipes/likes-me", auth, (req, res) => {
+app.get("/api/swipes/likes-me", auth, requireVerified, (req, res) => {
   const me = req.user.id;
   const rows = db.prepare(`
     SELECT s.swiper_id AS id FROM swipes s
@@ -506,7 +751,7 @@ app.get("/api/swipes/likes-me", auth, (req, res) => {
 });
 
 /* i miei match: like reciproci */
-app.get("/api/swipes/matches", auth, (req, res) => {
+app.get("/api/swipes/matches", auth, requireVerified, (req, res) => {
   const me = req.user.id;
   const rows = db.prepare(`
     SELECT s.target_id AS id FROM swipes s
@@ -517,7 +762,7 @@ app.get("/api/swipes/matches", auth, (req, res) => {
   res.json(rows.map((r) => userSummary(r.id)).filter((u) => u && !isBlockedEither(me, u.id)));
 });
 
-app.get("/api/people/:id", auth, (req, res) => {
+app.get("/api/people/:id", auth, requireVerified, (req, res) => {
   const u = db.prepare("SELECT * FROM users WHERE id = ? AND verified = 1").get(req.params.id);
   if (!u || isBlockedEither(req.user.id, u.id)) return res.status(404).json({ error: "Profilo non disponibile" });
   res.json(profileFor(u, req.user.id));
@@ -525,32 +770,62 @@ app.get("/api/people/:id", auth, (req, res) => {
 
 /* ————————————————— FOTO ————————————————— */
 
-app.post("/api/me/photos", auth, upload.single("photo"), (req, res) => {
-  if (!req.file) return res.status(400).json({ error: "Nessun file" });
-  const count = db.prepare("SELECT COUNT(*) AS n FROM photos WHERE user_id = ?").get(req.user.id).n;
-  if (count >= 6) {
-    fs.unlinkSync(req.file.path);
-    return res.status(400).json({ error: "Massimo 6 foto" });
+/* ogni foto arriva in tre versioni, preparate dal browser di chi la carica:
+   "photo" (grande), "thumb" (miniatura per la griglia) e "blur" (minuscola e sfocata,
+   l'unica che vedono gli altri se la foto è nascosta). Così la griglia è leggera e
+   la sfocatura non è un effetto grafico sopra la foto vera, ma un file diverso. */
+const photoUpload = upload.fields([
+  { name: "photo", maxCount: 1 },
+  { name: "thumb", maxCount: 1 },
+  { name: "blur", maxCount: 1 },
+]);
+const MAX_THUMB_BYTES = 400 * 1024;
+const MAX_BLUR_BYTES = 100 * 1024;
+
+function removeUploads(...names) {
+  for (const n of names) {
+    if (!n) continue;
+    const p = path.join(uploadDir, n);
+    try { if (fs.existsSync(p)) fs.unlinkSync(p); } catch { /* già rimosso */ }
   }
+}
+
+app.post("/api/me/photos", auth, photoUpload, (req, res) => {
+  const f = req.files?.photo?.[0];
+  const th = req.files?.thumb?.[0];
+  const bl = req.files?.blur?.[0];
+  const cleanup = () => removeUploads(f?.filename, th?.filename, bl?.filename);
+
+  if (!f) { cleanup(); return res.status(400).json({ error: "Nessun file" }); }
+  if ((th && th.size > MAX_THUMB_BYTES) || (bl && bl.size > MAX_BLUR_BYTES)) {
+    cleanup();
+    return res.status(400).json({ error: "Anteprima troppo grande" });
+  }
+  const count = db.prepare("SELECT COUNT(*) AS n FROM photos WHERE user_id = ?").get(req.user.id).n;
+  if (count >= 6) { cleanup(); return res.status(400).json({ error: "Massimo 6 foto" }); }
+
   const id = uid();
-  db.prepare("INSERT INTO photos (id, user_id, filename, position, created_at) VALUES (?,?,?,?,?)")
-    .run(id, req.user.id, req.file.filename, count, nowMs());
+  db.prepare("INSERT INTO photos (id, user_id, filename, thumb_filename, blur_filename, position, created_at) VALUES (?,?,?,?,?,?,?)")
+    .run(id, req.user.id, f.filename, th?.filename || "", bl?.filename || "", count, nowMs());
   io.emit("people-changed");
-  res.json({ id, url: `/uploads/${req.file.filename}`, friends_only: false });
+  res.json({
+    id, hidden: false, friends_only: false,
+    url: `/uploads/${f.filename}`,
+    thumb: `/uploads/${th?.filename || f.filename}`,
+  });
 });
 
 app.delete("/api/me/photos/:photoId", auth, (req, res) => {
   const photo = db.prepare("SELECT * FROM photos WHERE id = ? AND user_id = ?").get(req.params.photoId, req.user.id);
   if (!photo) return res.status(404).json({ error: "Foto non trovata" });
   db.prepare("DELETE FROM photos WHERE id = ?").run(photo.id);
-  const filePath = path.join(uploadDir, photo.filename);
-  if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+  removeUploads(photo.filename, photo.thumb_filename, photo.blur_filename);
   io.emit("people-changed");
   res.json({ ok: true });
 });
 
-/* "solo amici": se attivo, la foto la vedono solo il titolare e i suoi amici
-   accettati (né nel profilo, né nello swipe di Persone) */
+/* "sfocata": se attivo, gli altri vedono di questa foto solo la versione sfocata;
+   la vedono nitida solo il titolare e i suoi amici accettati */
 app.patch("/api/me/photos/:photoId", auth, (req, res) => {
   const photo = db.prepare("SELECT * FROM photos WHERE id = ? AND user_id = ?").get(req.params.photoId, req.user.id);
   if (!photo) return res.status(404).json({ error: "Foto non trovata" });
@@ -594,8 +869,10 @@ app.get("/api/rooms/:roomId/messages", (req, res) => {
   if (room.access === "members") {
     const header = req.headers.authorization || "";
     const token = header.startsWith("Bearer ") ? header.slice(7) : null;
-    try { jwt.verify(token, JWT_SECRET); }
-    catch { return res.status(403).json({ error: "Stanza riservata agli iscritti" }); }
+    let who = null;
+    try { who = jwt.verify(token, JWT_SECRET); } catch { who = null; }
+    if (!who?.id) return res.status(403).json({ error: "Stanza riservata agli iscritti" });
+    if (!isVerified(who.id)) return res.status(403).json(AGE_GATE_ERROR);
   }
 
   const msgs = db.prepare(`
@@ -709,26 +986,119 @@ app.delete("/api/mutes/:userId", auth, (req, res) => {
   res.json({ ok: true });
 });
 
+/* ————————————————— RICHIESTE DI MESSAGGIO / ROSE ————————————————— */
+
+/* Per scrivere a una persona nuova si chiede, e lei accetta o rifiuta:
+   - amici, match e richieste già accettate: si scrive direttamente
+   - altrimenti: richiesta gratuita, oppure — se la persona ha attivato "DM privati" —
+     solo con una rosa (richiesta con priorità, a pagamento)
+   La rosa compra la priorità, non l'accesso: la persona decide sempre. Se rifiuta,
+   non si può riprovare (né a pagamento) e la rosa non viene restituita. */
+app.post("/api/dm-requests/:userId", auth, requireVerified, (req, res) => {
+  const other = relationTarget(req, res); if (!other) return;
+  const me = req.user.id;
+  if (isBlockedEither(me, other)) return res.status(403).json({ error: "Azione non disponibile" });
+  const target = db.prepare("SELECT * FROM users WHERE id = ?").get(other);
+  if (AGE_GATE && !target.age_verified)
+    return res.status(403).json({ error: "Questa persona non ha ancora verificato l'età" });
+  const rose = !!req.body?.rose;
+
+  /* già possibile scrivere: apro il canale e basta */
+  if (canOpenDirect(me, other)) {
+    const dm = openDmChannel(me, other, me);
+    return res.json({ ok: true, dm });
+  }
+
+  const outgoing = getRequest(me, other);
+  if (outgoing?.status === "pending") return res.status(409).json({ error: "Hai già inviato una richiesta a questa persona" });
+  if (outgoing?.status === "declined") return res.status(403).json({ error: "Questa persona non ha accettato la tua richiesta" });
+
+  /* mi aveva già chiesto lei/lui: l'intenzione è reciproca, si apre subito */
+  const incoming = getRequest(other, me);
+  if (incoming?.status === "pending") {
+    db.prepare("UPDATE dm_requests SET status = 'accepted' WHERE from_id = ? AND to_id = ?").run(other, me);
+    const dm = openDmChannel(me, other);
+    notifyUser(other, "dm-request-accepted"); notifyUser(me, "dm-request-accepted");
+    return res.json({ ok: true, dm, accepted: true });
+  }
+
+  if (target.dm_private && !rose)
+    return res.status(403).json({ error: "Questa persona accetta messaggi solo con una rosa", code: "ROSE_REQUIRED" });
+
+  /* anti-spam: un numero massimo di richieste nuove al giorno */
+  const recent = db.prepare("SELECT COUNT(*) AS n FROM dm_requests WHERE from_id = ? AND created_at > ?")
+    .get(me, nowMs() - 24 * 60 * 60 * 1000).n;
+  if (recent >= MAX_REQUESTS_PER_DAY)
+    return res.status(429).json({ error: "Hai raggiunto il limite di richieste di oggi, riprova domani" });
+
+  const ok = db.transaction(() => {
+    if (rose) {
+      const u = db.prepare("SELECT tokens FROM users WHERE id = ?").get(me);
+      if ((u?.tokens || 0) < ROSE_COST) return false;
+      db.prepare("UPDATE users SET tokens = tokens - ? WHERE id = ?").run(ROSE_COST, me);
+    }
+    db.prepare("INSERT INTO dm_requests (from_id, to_id, status, rose, cost, created_at) VALUES (?,?,?,?,?,?)")
+      .run(me, other, "pending", rose ? 1 : 0, rose ? ROSE_COST : 0, nowMs());
+    return true;
+  })();
+  if (!ok) return res.status(402).json({ error: "Saldo insufficiente per inviare una rosa" });
+
+  notifyUser(other, "dm-request-received");
+  const tokens = db.prepare("SELECT tokens FROM users WHERE id = ?").get(me).tokens;
+  res.json({ ok: true, requested: true, rose, tokens });
+});
+
+/* le richieste che ho ricevuto (le rose in cima) e a chi ne ho inviata una */
+app.get("/api/dm-requests", auth, (req, res) => {
+  const me = req.user.id;
+  const incoming = db.prepare("SELECT * FROM dm_requests WHERE to_id = ? AND status = 'pending' ORDER BY rose DESC, created_at DESC").all(me)
+    .map((r) => ({ from: userSummary(r.from_id), rose: !!r.rose, created_at: r.created_at }))
+    .filter((r) => r.from && !isBlockedEither(me, r.from.id));
+  const outgoing = db.prepare("SELECT to_id FROM dm_requests WHERE from_id = ? AND status = 'pending'").all(me).map((r) => r.to_id);
+  res.json({ incoming, outgoing });
+});
+
+app.post("/api/dm-requests/:userId/accept", auth, requireVerified, (req, res) => {
+  const other = relationTarget(req, res); if (!other) return;
+  const me = req.user.id;
+  if (isBlockedEither(me, other)) return res.status(403).json({ error: "Azione non disponibile" });
+  const r = getRequest(other, me);
+  if (!r || r.status !== "pending") return res.status(404).json({ error: "Nessuna richiesta da accettare" });
+  db.prepare("UPDATE dm_requests SET status = 'accepted' WHERE from_id = ? AND to_id = ?").run(other, me);
+  const dm = openDmChannel(me, other);
+  notifyUser(other, "dm-request-accepted"); notifyUser(me, "dm-request-accepted");
+  res.json({ ok: true, dm });
+});
+
+/* rifiuto silenzioso: chi ha inviato la richiesta non riceve nessun avviso */
+app.post("/api/dm-requests/:userId/decline", auth, (req, res) => {
+  const other = relationTarget(req, res); if (!other) return;
+  const r = getRequest(other, req.user.id);
+  if (!r || r.status !== "pending") return res.status(404).json({ error: "Nessuna richiesta da rifiutare" });
+  db.prepare("UPDATE dm_requests SET status = 'declined' WHERE from_id = ? AND to_id = ?").run(other, req.user.id);
+  notifyUser(req.user.id, "dm-request-accepted"); // solo per far ricaricare l'elenco a chi ha rifiutato
+  res.json({ ok: true });
+});
+
 /* ————————————————— DM ————————————————— */
 
-app.post("/api/dms/:otherUserId", auth, (req, res) => {
+/* apre una conversazione: possibile subito solo con amici, match o richieste
+   accettate; con tutti gli altri bisogna passare dalla richiesta */
+app.post("/api/dms/:otherUserId", auth, requireVerified, (req, res) => {
   const other = db.prepare("SELECT id FROM users WHERE id = ? AND verified = 1").get(req.params.otherUserId);
   if (!other) return res.status(404).json({ error: "Utente non trovato" });
   if (other.id === req.user.id) return res.status(400).json({ error: "Non puoi scrivere a te stesso" });
   if (isBlockedEither(req.user.id, other.id))
     return res.status(403).json({ error: "Non puoi scrivere a questo utente." });
-  const [a, b] = [req.user.id, other.id].sort();
-  let dm = db.prepare("SELECT * FROM dms WHERE user_a = ? AND user_b = ?").get(a, b);
-  if (!dm) {
-    dm = { id: `dm-${uid()}`, user_a: a, user_b: b, creator_id: req.user.id, created_at: nowMs() };
-    db.prepare("INSERT INTO dms (id, user_a, user_b, creator_id, created_at) VALUES (?,?,?,?,?)")
-      .run(dm.id, a, b, dm.creator_id, dm.created_at);
-  }
-  res.json(dm);
+  const existing = getDm(req.user.id, other.id);
+  if (existing) return res.json(existing);
+  if (!canOpenDirect(req.user.id, other.id))
+    return res.status(403).json({ error: "Per scrivere a questa persona serve prima una richiesta.", code: "REQUEST_REQUIRED" });
+  res.json(openDmChannel(req.user.id, other.id, req.user.id));
 });
 
-/* le mie conversazioni: quelle che ho aperto io, più quelle in cui qualcuno
-   mi ha già scritto (le DM vuote aperte da altri non compaiono) */
+/* le mie conversazioni: quelle aperte da me o da entrambi, più quelle in cui
+   qualcuno mi ha già scritto */
 app.get("/api/dms", auth, (req, res) => {
   const me = req.user.id;
   const list = db.prepare(`
@@ -738,7 +1108,7 @@ app.get("/api/dms", auth, (req, res) => {
     FROM dms d WHERE d.user_a = ? OR d.user_b = ?
   `).all(me, me);
   const enriched = list
-    .filter((dm) => dm.creator_id === me || dm.msg_count > 0)
+    .filter((dm) => dm.creator_id === me || dm.creator_id === "both" || dm.msg_count > 0)
     .map((dm) => ({ ...dm, other: userSummary(dm.user_a === me ? dm.user_b : dm.user_a) }))
     .filter((dm) => dm.other)
     .sort((x, y) => (y.last_at || y.created_at) - (x.last_at || x.created_at));
@@ -813,55 +1183,46 @@ io.on("connection", (socket) => {
       if (!room) return socket.emit("errorMsg", "Stanza non trovata");
       if (room.access === "members" && socket.data.guest)
         return socket.emit("errorMsg", "Stanza riservata agli iscritti");
+      if (room.access === "members" && !isVerified(socket.data.user.id))
+        return socket.emit("errorMsg", AGE_GATE_ERROR.error);
     }
     socket.join(roomId);
   });
 
   socket.on("message", ({ roomId, text, image, sensitive }) => {
     if (typeof roomId !== "string") return;
+    /* i guest sono solo lettura, in ogni stanza e in ogni conversazione */
+    if (socket.data.guest) return socket.emit("errorMsg", "Registrati per scrivere");
+    const userId = socket.data.user.id;
     const isDm = roomId.startsWith("dm-");
     let dmRow = null;
 
     if (isDm) {
-      /* le DM richiedono sempre un utente registrato e partecipante */
-      if (socket.data.guest) return socket.emit("errorMsg", "Registrati per scrivere");
+      /* messaggi privati: solo tra partecipanti, mai con un bloccato, e (con il
+         gate attivo) solo da chi ha verificato l'età */
+      if (!isVerified(userId)) return socket.emit("errorMsg", AGE_GATE_ERROR.error);
       dmRow = db.prepare("SELECT * FROM dms WHERE id = ?").get(roomId);
-      if (!dmRow || (dmRow.user_a !== socket.data.user.id && dmRow.user_b !== socket.data.user.id))
+      if (!dmRow || (dmRow.user_a !== userId && dmRow.user_b !== userId))
         return socket.emit("errorMsg", "DM non trovata");
-      const otherId = dmRow.user_a === socket.data.user.id ? dmRow.user_b : dmRow.user_a;
-      if (isBlockedEither(socket.data.user.id, otherId))
+      const otherId = dmRow.user_a === userId ? dmRow.user_b : dmRow.user_a;
+      if (isBlockedEither(userId, otherId))
         return socket.emit("errorMsg", "Non puoi inviare messaggi a questo utente.");
     } else {
       const room = db.prepare("SELECT * FROM rooms WHERE id = ?").get(roomId);
       if (!room) return;
-      /* i guest possono scrivere SOLO nelle stanze ad accesso "open" */
-      if (socket.data.guest && room.access !== "open")
-        return socket.emit("errorMsg", "Registrati per scrivere in questa stanza");
+      if (room.access === "members" && !isVerified(userId))
+        return socket.emit("errorMsg", AGE_GATE_ERROR.error);
     }
 
-    /* utente: registrato normale, oppure guest anonimo con id generato per il socket */
-    let userId, u;
-    if (socket.data.guest) {
-      if (!socket.data.guestId) socket.data.guestId = `guest-${socket.id}`;
-      userId = socket.data.guestId;
-      u = { name: "Guest", handle: "guest", avatar: "" };
-    } else {
-      userId = socket.data.user.id;
-      u = db.prepare("SELECT name, handle, avatar FROM users WHERE id = ?").get(userId);
-    }
-
+    const u = db.prepare("SELECT name, handle, avatar FROM users WHERE id = ?").get(userId);
     const msg = {
       id: uid(), room_id: roomId, user_id: userId,
       text: String(text || "").slice(0, 2000),
       image: image || null, sensitive: sensitive ? 1 : 0,
       created_at: nowMs(),
     };
-    /* i messaggi dei guest anonimi non vengono salvati in cronologia
-       (non hanno un utente reale in tabella users da referenziare) */
-    if (!socket.data.guest) {
-      db.prepare("INSERT INTO messages (id, room_id, user_id, text, image, sensitive, created_at) VALUES (?,?,?,?,?,?,?)")
-        .run(msg.id, msg.room_id, msg.user_id, msg.text, msg.image, msg.sensitive, msg.created_at);
-    }
+    db.prepare("INSERT INTO messages (id, room_id, user_id, text, image, sensitive, created_at) VALUES (?,?,?,?,?,?,?)")
+      .run(msg.id, msg.room_id, msg.user_id, msg.text, msg.image, msg.sensitive, msg.created_at);
     const payload = { ...msg, ...u };
     if (isDm) {
       /* arriva a tutte le sessioni di entrambi i partecipanti: chi riceve la
@@ -878,6 +1239,9 @@ io.on("connection", (socket) => {
 /* ———— avvio ———— */
 httpServer.listen(PORT, () => {
   console.log(`Foyer backend in ascolto sulla porta ${PORT}`);
+  console.log(AGE_GATE
+    ? "Verifica età ATTIVA: Persone, richieste/DM e stanza rosa richiedono la verifica."
+    : "⚠ Verifica età NON attiva (nessun Yoti configurato): Persone, DM e stanza rosa sono aperti a tutti i registrati.");
   console.log(process.env.DATA_DIR
     ? `Dati salvati in ${DATA_DIR} (disco persistente: gli account restano dopo riavvii e deploy)`
     : "⚠ DATA_DIR non impostata: database e foto stanno su disco temporaneo e si cancellano a ogni riavvio/deploy");
